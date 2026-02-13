@@ -48,8 +48,19 @@ async function runVisaCheck(job) {
   }
 
   const { chromium } = require('playwright');
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  const path = require('path');
+  const fs = require('fs');
+
+  // Headful + persistent context (less likely to be served a bot-detection variant).
+  const profilesDir = path.join(__dirname, 'profiles');
+  fs.mkdirSync(profilesDir, { recursive: true });
+  const userDataDir = path.join(profilesDir, `client-${client.id || 'unknown'}`);
+
+  const context = await chromium.launchPersistentContext(userDataDir, {
+    headless: false,
+    viewport: { width: 1280, height: 800 }
+  });
+  const page = await context.newPage();
 
   const details = {
     stage: 'start',
@@ -159,10 +170,15 @@ async function runVisaCheck(job) {
       details
     };
   } catch (err) {
-    return { summary: `Blocked: automation error (${err.message})`, details: { ...details, stage: details.stage } };
+    // Common headful failure on servers without a display.
+    const msg = String(err?.message || err);
+    if (msg.match(/x server|display|headed|no usable sandbox/i)) {
+      return { summary: 'Blocked: worker has no desktop display for headful browser (needs X/Xvfb)', details: { ...details, error: msg } };
+    }
+    return { summary: `Blocked: automation error (${msg})`, details: { ...details, stage: details.stage } };
   } finally {
     await page.close().catch(() => {});
-    await browser.close().catch(() => {});
+    await context.close().catch(() => {});
   }
 }
 
