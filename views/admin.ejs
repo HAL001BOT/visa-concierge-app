@@ -1,1 +1,51 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin Dashboard</title><style>body{font-family:Arial,sans-serif;max-width:1200px;margin:24px auto;padding:0 12px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}th{background:#f5f5f5}form{display:inline}.muted{color:#666}.badge{padding:2px 8px;border-radius:12px;font-size:12px}.on{background:#e8ffe8;color:#1b6f1b}.off{background:#ffe9e9;color:#8a1f1f}button{padding:6px 10px}</style></head><body><h1>Admin Dashboard</h1><form method="post" action="/admin/logout"><button>Logout</button></form><p>Total clients: <strong><%= clients.length %></strong></p><table><thead><tr><th>Created</th><th>Name</th><th>Contact</th><th>Portal User</th><th>Targets</th><th>Status</th><th>Last Check</th><th>Actions</th><th>Notes</th></tr></thead><tbody><% clients.forEach(c => { %><tr><td><%= c.created_at %></td><td><strong><%= c.full_name %></strong><div class="muted"><%= c.timezone || '' %></div></td><td><%= c.contact_channel %><br><%= c.contact_handle %></td><td><div><%= c.username %></div><div class="muted"><%= c.portal_url %></div></td><td><div><strong>Cities:</strong> <%= c.target_cities %></div><div><strong>Months:</strong> <%= c.target_months %></div><div><strong>Auto-book:</strong> <%= c.auto_book ? 'Yes' : 'No' %></div></td><td><span class="badge <%= c.monitoring_active ? 'on' : 'off' %>"><%= c.monitoring_active ? 'Monitoring ON' : 'Monitoring OFF' %></span><div class="muted" style="margin-top:6px"><%= c.last_result || '—' %></div></td><td><%= c.last_check_at || '—' %></td><td><form method="post" action="/admin/clients/<%= c.id %>/check"><button>Run Check</button></form> <form method="post" action="/admin/clients/<%= c.id %>/toggle"><button><%= c.monitoring_active ? 'Pause' : 'Resume' %></button></form></td><td><%= c.notes || '' %></td></tr><% }) %></tbody></table></body></html>
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Admin Dashboard</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="container" style="max-width:1280px">
+    <div class="topbar">
+      <div>
+        <span class="badge">Operations</span>
+        <h1 style="font-size:30px;margin:8px 0 0">Client Dashboard</h1>
+        <div class="small">Total clients: <strong><%= clients.length %></strong></div>
+      </div>
+      <form method="post" action="/admin/logout"><button class="btn secondary">Logout</button></form>
+    </div>
+
+    <div class="card table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Created</th><th>Client</th><th>Contact</th><th>Portal</th><th>Targets</th><th>Status</th><th>Last Check</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <% clients.forEach(c => { %>
+            <tr>
+              <td><%= c.created_at %></td>
+              <td><strong><%= c.full_name %></strong><div class="small"><%= c.timezone || '' %></div></td>
+              <td><%= c.contact_channel %><br/><span class="small"><%= c.contact_handle %></span></td>
+              <td><%= c.username %><div class="small"><%= c.portal_url %></div></td>
+              <td><strong>Cities:</strong> <%= c.target_cities %><br/><strong>Months:</strong> <%= c.target_months %><br/><strong>Auto-book:</strong> <%= c.auto_book ? 'Yes' : 'No' %></td>
+              <td>
+                <span class="status <%= c.monitoring_active ? 'on':'off' %>"><%= c.monitoring_active ? 'Monitoring ON':'Monitoring OFF' %></span>
+                <div class="small" style="margin-top:6px"><%= c.last_result || '—' %></div>
+              </td>
+              <td><%= c.last_check_at || '—' %></td>
+              <td>
+                <form method="post" action="/admin/clients/<%= c.id %>/check"><button class="btn secondary">Run Check</button></form>
+                <form method="post" action="/admin/clients/<%= c.id %>/toggle"><button class="btn" style="margin-top:6px"><%= c.monitoring_active ? 'Pause':'Resume' %></button></form>
+              </td>
+            </tr>
+          <% }) %>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>
