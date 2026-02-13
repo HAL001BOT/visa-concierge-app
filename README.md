@@ -8,13 +8,14 @@ Simple intake form + admin dashboard draft.
 - Admin dashboard listing submitted clients
 - **Encrypted credential storage at rest** (AES-256-GCM via `CREDENTIALS_KEY`)
 - Per-client monitoring status + manual check controls
+- “Send to Bot” action that posts a check request to your automation webhook
 - SQLite local storage
 
 ## Quick run
 ```bash
 npm install
 cp .env.example .env
-# edit .env (set ADMIN_PASSWORD + SESSION_SECRET + CREDENTIALS_KEY)
+# edit .env (set ADMIN_PASSWORD + SESSION_SECRET + CREDENTIALS_KEY + bot webhook vars)
 npm start
 ```
 
@@ -33,6 +34,8 @@ Open:
    - `SESSION_SECRET`
    - `CREDENTIALS_KEY`
    - `DB_PATH=/var/data/data.db` (recommended on Render)
+   - `BOT_WEBHOOK_URL`
+   - `BOT_WEBHOOK_TOKEN`
 5. Add a persistent disk mounted at `/var/data`.
 
 ### Railway
@@ -42,6 +45,29 @@ Open:
    - `SESSION_SECRET`
    - `CREDENTIALS_KEY`
 3. Start command: `npm start`
+
+## Bot webhook contract
+When you click **Send to Bot**, the app POSTs JSON to `BOT_WEBHOOK_URL` with `Authorization: Bearer <BOT_WEBHOOK_TOKEN>`.
+Payload shape:
+
+```json
+{
+  "event": "visa_check_request",
+  "requestedAt": "ISO_DATE",
+  "client": {
+    "id": 1,
+    "full_name": "...",
+    "contact_channel": "Telegram",
+    "contact_handle": "...",
+    "portal_url": "https://ais.usvisa-info.com/",
+    "username": "...",
+    "password": "...",
+    "target_cities": "Mexico City, Guadalajara",
+    "target_months": "February, March",
+    "auto_book": false
+  }
+}
+```
 
 ## Important
 This is a starter draft. Before production, add:

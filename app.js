@@ -12,6 +12,8 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-me-now';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change-me';
 const PORT = process.env.PORT || 3000;
 const CREDENTIALS_KEY = process.env.CREDENTIALS_KEY || 'change-this-32-char-key-now';
+const BOT_WEBHOOK_URL = process.env.BOT_WEBHOOK_URL || '';
+const BOT_WEBHOOK_TOKEN = process.env.BOT_WEBHOOK_TOKEN || '';
 
 if (CREDENTIALS_KEY.length < 16) {
   throw new Error('CREDENTIALS_KEY must be set and reasonably long.');
@@ -25,6 +27,17 @@ function encryptText(plain) {
   const enc = Buffer.concat([cipher.update(String(plain), 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
   return `${iv.toString('base64')}.${tag.toString('base64')}.${enc.toString('base64')}`;
+}
+
+function decryptText(payload) {
+  const [ivB64, tagB64, encB64] = String(payload || '').split('.');
+  if (!ivB64 || !tagB64 || !encB64) return '';
+  const iv = Buffer.from(ivB64, 'base64');
+  const tag = Buffer.from(tagB64, 'base64');
+  const enc = Buffer.from(encB64, 'base64');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', ENC_KEY, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
 }
 
 app.set('view engine', 'ejs');
@@ -125,10 +138,63 @@ app.post('/admin/clients/:id/toggle', requireAdmin, (req, res) => {
   res.redirect('/admin');
 });
 
-app.post('/admin/clients/:id/check', requireAdmin, (req, res) => {
+app.post('/admin/clients/:id/check', requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
-  db.prepare('UPDATE clients SET last_check_at=CURRENT_TIMESTAMP, last_result=? WHERE id=?')
-    .run('Manual check requested (wire to automation worker)', id);
+  const client = db.prepare(`
+    SELECT id, full_name, contact_channel, contact_handle, timezone, portal_url, username,
+           password_enc, target_cities, target_months, auto_book, monitoring_active
+    FROM clients
+    WHERE id=?
+  `).get(id);
+
+  if (!client) return res.redirect('/admin');
+
+  if (!BOT_WEBHOOK_URL || !BOT_WEBHOOK_TOKEN) {
+    db.prepare('UPDATE clients SET last_check_at=CURRENT_TIMESTAMP, last_result=? WHERE id=?')
+      .run('Bot dispatch failed: BOT_WEBHOOK_URL/TOKEN not configured', id);
+    return res.redirect('/admin');
+  }
+
+  try {
+    const password = decryptText(client.password_enc);
+    const body = {
+      event: 'visa_check_request',
+      requestedAt: new Date().toISOString(),
+      client: {
+        id: client.id,
+        full_name: client.full_name,
+        contact_channel: client.contact_channel,
+        contact_handle: client.contact_handle,
+        timezone: client.timezone,
+        portal_url: client.portal_url,
+        username: client.username,
+        password,
+        target_cities: client.target_cities,
+        target_months: client.target_months,
+        auto_book: !!client.auto_book
+      }
+    };
+
+    const response = await fetch(BOT_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${BOT_WEBHOOK_TOKEN}`
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    db.prepare('UPDATE clients SET last_check_at=CURRENT_TIMESTAMP, last_result=? WHERE id=?')
+      .run('Sent to bot successfully', id);
+  } catch (err) {
+    db.prepare('UPDATE clients SET last_check_at=CURRENT_TIMESTAMP, last_result=? WHERE id=?')
+      .run(`Bot dispatch failed: ${err.message}`, id);
+  }
+
   res.redirect('/admin');
 });
 
