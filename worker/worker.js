@@ -59,12 +59,31 @@ async function runVisaCheck(job) {
   };
 
   try {
-    await page.goto(portalUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const { origin } = new URL(portalUrl);
 
-    // If already on sign-in page, proceed; otherwise click Sign in.
-    const signInLink = page.getByRole('link', { name: /sign in/i });
-    if (await signInLink.count()) {
-      await signInLink.first().click({ timeout: 15000 });
+    // Try to land on a sign-in form deterministically.
+    details.stage = 'goto';
+    const signInCandidates = [
+      portalUrl,
+      `${origin}/en-mx/niv/users/sign_in`,
+      `${origin}/en-us/niv/users/sign_in`,
+      `${origin}/niv/users/sign_in`,
+      `${origin}/users/sign_in`
+    ];
+
+    for (const u of signInCandidates) {
+      await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      const hasEmail = await page.locator('input[type="email"], input[name*="email" i], input#user_email, input#Email').first().isVisible().catch(() => false);
+      if (hasEmail) break;
+
+      // If we landed on a marketing page, try clicking Sign in.
+      const signInLink = page.getByRole('link', { name: /sign in/i });
+      if (await signInLink.count()) {
+        await signInLink.first().click({ timeout: 15000 }).catch(() => {});
+      }
+
+      const hasEmailAfter = await page.locator('input[type="email"], input[name*="email" i], input#user_email, input#Email').first().isVisible().catch(() => false);
+      if (hasEmailAfter) break;
     }
 
     // Detect lockout banner text if present.
@@ -74,14 +93,15 @@ async function runVisaCheck(job) {
       return { summary: 'Blocked: account locked (cooldown required)', details };
     }
 
-    // Fill credentials
+    // Fill credentials (robust selectors)
     details.stage = 'fill';
-    await page.getByLabel(/email/i).fill(String(username), { timeout: 15000 }).catch(async () => {
-      await page.locator('input[type="email"], input[name*="email" i]').first().fill(String(username));
-    });
-    await page.getByLabel(/password/i).fill(String(password), { timeout: 15000 }).catch(async () => {
-      await page.locator('input[type="password"]').first().fill(String(password));
-    });
+    const emailInput = page.locator('input[type="email"], input#user_email, input[name*="email" i], input[name*="username" i]').first();
+    await emailInput.waitFor({ state: 'visible', timeout: 30000 });
+    await emailInput.fill(String(username));
+
+    const passInput = page.locator('input[type="password"], input#user_password').first();
+    await passInput.waitFor({ state: 'visible', timeout: 30000 });
+    await passInput.fill(String(password));
 
     // Try to accept terms/privacy if checkbox present
     details.stage = 'consent';
