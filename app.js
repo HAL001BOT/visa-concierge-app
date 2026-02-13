@@ -162,6 +162,46 @@ app.post('/admin/clients/:id/toggle', requireAdmin, (req, res) => {
   res.redirect('/admin');
 });
 
+app.get('/admin/clients/:id/edit', requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const client = db.prepare('SELECT * FROM clients WHERE id=?').get(id);
+  if (!client) return res.redirect('/admin');
+  res.render('admin-edit-client', { client, ok: req.query.ok });
+});
+
+app.post('/admin/clients/:id/edit', requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const existing = db.prepare('SELECT * FROM clients WHERE id=?').get(id);
+  if (!existing) return res.redirect('/admin');
+
+  const body = req.body;
+  const nextPasswordEnc = (body.password && String(body.password).trim())
+    ? encryptText(String(body.password))
+    : existing.password_enc;
+
+  db.prepare(`UPDATE clients SET
+      full_name=?, contact_channel=?, contact_handle=?, timezone=?, portal_url=?, username=?, password_enc=?,
+      target_cities=?, target_months=?, auto_book=?, notes=?
+    WHERE id=?`).run(
+      body.full_name,
+      body.contact_channel,
+      body.contact_handle,
+      body.timezone,
+      body.portal_url,
+      body.username,
+      nextPasswordEnc,
+      body.target_cities,
+      body.target_months,
+      body.auto_book ? 1 : 0,
+      body.notes || '',
+      id
+    );
+
+  db.prepare('UPDATE clients SET last_result=? WHERE id=?').run('Client updated', id);
+
+  res.redirect(`/admin/clients/${id}/edit?ok=1`);
+});
+
 app.post('/admin/clients/:id/check', requireAdmin, (req, res) => {
   const id = Number(req.params.id);
   const client = db.prepare(`

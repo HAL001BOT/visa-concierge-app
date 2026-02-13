@@ -21,7 +21,7 @@
       <table>
         <thead>
           <tr>
-            <th>Created</th><th>Client</th><th>Contact</th><th>Portal</th><th>Targets</th><th>Status</th><th>Last Check</th><th>Actions</th>
+            <th>Created</th><th>Client</th><th>Contact</th><th>Portal</th><th>Targets</th><th>Status</th><th>Last Check</th><th>Actions</th><th>Edit</th>
           </tr>
         </thead>
         <tbody>
@@ -40,6 +40,9 @@
               <td>
                 <form method="post" action="/admin/clients/<%= c.id %>/check"><button class="btn secondary">Queue Check</button></form>
                 <form method="post" action="/admin/clients/<%= c.id %>/toggle"><button class="btn" style="margin-top:6px"><%= c.monitoring_active ? 'Pause':'Resume' %></button></form>
+              </td>
+              <td>
+                <a class="btn secondary" href="/admin/clients/<%= c.id %>/edit">Edit</a>
               </td>
             </tr>
           <% }) %>

@@ -1,0 +1,83 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Edit Client</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="container" style="max-width:900px">
+    <div class="topbar">
+      <div>
+        <span class="badge">Admin</span>
+        <h1 style="font-size:30px;margin:8px 0 0">Edit Client</h1>
+        <div class="small">Client ID: <strong><%= client.id %></strong></div>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center">
+        <a class="btn secondary" href="/admin">Back</a>
+        <form method="post" action="/admin/logout"><button class="btn secondary">Logout</button></form>
+      </div>
+    </div>
+
+    <div class="card">
+      <% if (ok) { %><p class="ok">Saved.</p><% } %>
+      <form method="post" action="/admin/clients/<%= client.id %>/edit">
+        <div class="grid">
+          <div>
+            <label>Full name</label>
+            <input name="full_name" value="<%= client.full_name %>" required />
+          </div>
+          <div>
+            <label>Time zone</label>
+            <input name="timezone" value="<%= client.timezone || '' %>" placeholder="America/Chicago" />
+          </div>
+          <div>
+            <label>Contact channel</label>
+            <select name="contact_channel">
+              <% const chans = ['WhatsApp','Telegram','Email','SMS']; chans.forEach(ch => { %>
+                <option value="<%= ch %>" <%= (client.contact_channel===ch ? 'selected' : '') %>><%= ch %></option>
+              <% }) %>
+            </select>
+          </div>
+          <div>
+            <label>Contact handle/number</label>
+            <input name="contact_handle" value="<%= client.contact_handle %>" required />
+          </div>
+          <div class="row-2">
+            <label>Portal URL</label>
+            <input name="portal_url" value="<%= client.portal_url %>" required />
+          </div>
+          <div>
+            <label>Portal username/email</label>
+            <input name="username" value="<%= client.username %>" required />
+          </div>
+          <div>
+            <label>Portal password (leave blank to keep current)</label>
+            <input name="password" value="" placeholder="••••••••" />
+          </div>
+          <div>
+            <label>Target cities</label>
+            <input name="target_cities" value="<%= client.target_cities %>" required />
+          </div>
+          <div>
+            <label>Target months</label>
+            <input name="target_months" value="<%= client.target_months %>" required />
+          </div>
+          <div class="row-2">
+            <label><input type="checkbox" name="auto_book" <%= client.auto_book ? 'checked' : '' %> /> Auto-book matching slots</label>
+          </div>
+          <div class="row-2">
+            <label>Notes</label>
+            <textarea name="notes" rows="4"><%= client.notes || '' %></textarea>
+          </div>
+        </div>
+        <div class="actions">
+          <span class="small">Password is stored encrypted.</span>
+          <button class="btn" type="submit">Save Changes</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</body>
+</html>
