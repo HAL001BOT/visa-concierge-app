@@ -203,15 +203,38 @@ async function runVisaCheck(job) {
     if (await consent.count().catch(() => 0)) await consent.click({ timeout: 5000 }).catch(() => {});
 
     details.stage = 'submit';
+    // Common AIS consent checkbox ids/classes
+    const consentInput = page.locator('input#policy_confirmed, input[name*="policy" i][type="checkbox"], input[type="checkbox"]').first();
+    if (await consentInput.isVisible().catch(() => false)) {
+      const checked = await consentInput.isChecked().catch(() => false);
+      if (!checked) await consentInput.check({ timeout: 5000 }).catch(() => {});
+    }
+
     await clickFirst(page, [/sign in/i]).catch(() => {});
+    // Fallback: submit by pressing Enter in password field
+    await page.locator('input[type="password"], input#user_password').first().press('Enter').catch(() => {});
+
+    // Give it time to redirect
+    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
     await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
 
     details.stage = 'post';
-    const captcha = await page.locator('text=/captcha|verify you are human/i').first().isVisible().catch(() => false);
-    if (captcha) return { summary: 'Blocked: CAPTCHA / verification required', details };
+    const urlNow = page.url();
 
-    const invalid = await page.locator('text=/invalid|incorrect/i').first().isVisible().catch(() => false);
-    if (invalid) return { summary: 'Blocked: invalid credentials', details };
+    const captcha = await page.locator('text=/captcha|verify you are human|checking your browser|cloudflare|challenge/i').first().isVisible().catch(() => false);
+    if (captcha) return { summary: 'Blocked: CAPTCHA / verification required', details: { ...details, url: urlNow } };
+
+    const locked = await page.locator('text=/account is locked/i').first().isVisible().catch(() => false);
+    if (locked) return { summary: 'Blocked: account locked (cooldown required)', details: { ...details, url: urlNow } };
+
+    const invalid = await page.locator('text=/invalid|incorrect|wrong.*password|wrong.*email/i').first().isVisible().catch(() => false);
+    if (invalid) return { summary: 'Blocked: invalid credentials', details: { ...details, url: urlNow } };
+
+    // Still on sign-in page after submit usually means consent missing or creds wrong.
+    if (/\/users\/sign_in/.test(urlNow)) {
+      const msg = await page.locator('.alert, .error, .validation-summary-errors, [class*="error" i]').first().innerText().catch(() => '');
+      return { summary: `Blocked: login did not complete${msg ? ` (${msg.trim().slice(0,120)})` : ''}`, details: { ...details, url: urlNow } };
+    }
 
     // Navigate toward appointment page (robust)
     details.stage = 'nav';
