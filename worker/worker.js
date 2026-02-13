@@ -230,10 +230,14 @@ async function runVisaCheck(job) {
     const invalid = await page.locator('text=/invalid|incorrect|wrong.*password|wrong.*email/i').first().isVisible().catch(() => false);
     if (invalid) return { summary: 'Blocked: invalid credentials', details: { ...details, url: urlNow } };
 
-    // Still on sign-in page after submit usually means consent missing or creds wrong.
+    // Still on sign-in URL after submit can be a false positive (some AIS flows render authenticated landing content here).
     if (/\/users\/sign_in/.test(urlNow)) {
-      const msg = await page.locator('.alert, .error, .validation-summary-errors, [class*="error" i]').first().innerText().catch(() => '');
-      return { summary: `Blocked: login did not complete${msg ? ` (${msg.trim().slice(0,120)})` : ''}`, details: { ...details, url: urlNow } };
+      const looksLoggedIn = await page.locator('text=/Current Status|Schedule Appointment|Continue|Document Delivery/i').first().isVisible().catch(() => false);
+      if (!looksLoggedIn) {
+        const msg = await page.locator('.alert, .error, .validation-summary-errors, [class*="error" i]').first().innerText().catch(() => '');
+        return { summary: `Blocked: login did not complete${msg ? ` (${msg.trim().slice(0,120)})` : ''}`, details: { ...details, url: urlNow } };
+      }
+      // Otherwise proceed as logged in.
     }
 
     // If we are still on sign-in, decide whether it's a real failure or we actually landed on the user home.
