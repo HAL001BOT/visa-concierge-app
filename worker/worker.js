@@ -1,11 +1,8 @@
 #!/usr/bin/env node
 /**
- * Simple polling worker for visa-concierge-app.
+ * Visa Concierge polling worker.
  *
- * Usage:
- *   RENDER_APP_URL=https://your-render-app.onrender.com \
- *   WORKER_TOKEN=... \
- *   node worker.js
+ * Polls the Render app for queued jobs and processes them.
  */
 
 const APP_URL = process.env.RENDER_APP_URL;
@@ -57,7 +54,6 @@ function normalizeMonthToken(s) {
     dec: 'december', diciembre: 'december', december: 'december'
   };
 
-  // Handle common typos (e.g. 'febereo') by prefix match
   const key = t.slice(0, 3);
   if (map[t]) return map[t];
   if (map[key]) return map[key];
@@ -92,6 +88,222 @@ async function clickFirst(page, patterns) {
   return false;
 }
 
+async function pageInfo(page) {
+  const url = page.url();
+  const title = await page.title().catch(() => '');
+  return { url, title };
+}
+
+async function isChallenge(page) {
+  return await page.locator('text=/verify you are human|checking your browser|captcha|cloudflare|challenge/i').first()
+    .isVisible().catch(() => false);
+}
+
+async function isLocked(page) {
+  return await page.locator('text=/account is locked/i').first().isVisible().catch(() => false);
+}
+
+async function looksLoggedIn(page) {
+  // AIS is inconsistent; use multiple hints.
+  const hints = [
+    /Current Status/i,
+    /Schedule Appointment/i,
+    /Document Delivery/i,
+    /Sign Out|Logout|Cerrar sesi\u00f3n/i
+  ];
+  for (const h of hints) {
+    const ok = await page.locator(`text=${h}`).first().isVisible().catch(() => false);
+    if (ok) return true;
+  }
+  return false;
+}
+
+async function ensureMexicoCountrySelected(page, details) {
+  // If a country selector is present and contains Mexico, select it.
+  const select = page.locator('select').first();
+  const hasSelect = await select.isVisible().catch(() => false);
+  if (!hasSelect) return;
+
+  const mexOpt = page.locator('option', { hasText: /mexico/i }).first();
+  if (!await mexOpt.count().catch(() => 0)) return;
+
+  details.stage = 'country';
+  await select.selectOption({ label: /mexico/i }).catch(() => {});
+  await clickFirst(page, [/go|submit|continue|next/i]).catch(() => {});
+  await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+}
+
+async function gotoSignIn(page, portalUrl, details) {
+  const { origin } = new URL(portalUrl);
+
+  details.stage = 'goto';
+  const candidates = [
+    `${origin}/en-mx/niv/users/sign_in`,
+    `${origin}/en-us/niv/users/sign_in`,
+    `${origin}/niv/users/sign_in`,
+    `${origin}/users/sign_in`,
+    portalUrl
+  ];
+
+  for (const u of candidates) {
+    await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    await ensureMexicoCountrySelected(page, details);
+
+    if (await isChallenge(page)) return;
+
+    const emailInput = page.locator('input[type="email"], input#user_email, input[name*="email" i], input[name*="username" i], input#Email').first();
+    const visible = await emailInput.isVisible().catch(() => false);
+    if (visible) return;
+
+    // Sometimes sign-in is behind a link.
+    await clickFirst(page, [/sign in/i]).catch(() => {});
+    await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+
+    const visibleAfter = await emailInput.isVisible().catch(() => false);
+    if (visibleAfter) return;
+  }
+}
+
+async function doLogin(page, username, password, details) {
+  // If already logged in, skip.
+  if (await looksLoggedIn(page)) return 'logged_in';
+
+  if (await isChallenge(page)) return 'blocked_challenge';
+  if (await isLocked(page)) return 'blocked_lockout';
+
+  details.stage = 'fill';
+  const email = page.locator('input[type="email"], input#user_email, input[name*="email" i], input[name*="username" i], input#Email').first();
+  await email.waitFor({ state: 'visible', timeout: 30000 });
+  await email.fill(String(username));
+
+  const pass = page.locator('input[type="password"], input#user_password').first();
+  await pass.waitFor({ state: 'visible', timeout: 30000 });
+  await pass.fill(String(password));
+
+  details.stage = 'consent';
+  // Best-effort consent
+  const consentLabel = page.locator('label:has-text("Privacy Policy"), label:has-text("Terms")').first();
+  if (await consentLabel.count().catch(() => 0)) await consentLabel.click({ timeout: 5000 }).catch(() => {});
+  const consentInput = page.locator('input#policy_confirmed, input[name*="policy" i][type="checkbox"], input[type="checkbox"]').first();
+  if (await consentInput.isVisible().catch(() => false)) {
+    const checked = await consentInput.isChecked().catch(() => false);
+    if (!checked) await consentInput.check({ timeout: 5000 }).catch(() => {});
+  }
+
+  details.stage = 'submit';
+  await clickFirst(page, [/sign in/i]).catch(() => {});
+  await pass.press('Enter').catch(() => {});
+  await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+  await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+
+  details.stage = 'post';
+  if (await isChallenge(page)) return 'blocked_challenge';
+  if (await isLocked(page)) return 'blocked_lockout';
+
+  const invalid = await page.locator('text=/invalid|incorrect|wrong.*password|wrong.*email/i').first().isVisible().catch(() => false);
+  if (invalid) return 'blocked_invalid_creds';
+
+  if (await looksLoggedIn(page)) return 'logged_in';
+
+  // Still not clearly logged in.
+  return 'blocked_login_unknown';
+}
+
+async function gotoCalendarPage(page, details) {
+  details.stage = 'nav_home';
+
+  // From authenticated landing, we need to reach schedule page.
+  // Deterministic strategy:
+  // 1) Click Continue (sometimes needed)
+  // 2) Click Schedule/Reschedule
+  // 3) Otherwise: follow a href containing /schedule/
+
+  for (let i = 0; i < 4; i++) {
+    const moved = await clickFirst(page, [/continue|continuar/i]);
+    if (!moved) break;
+    await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+  }
+
+  details.stage = 'nav_schedule';
+  await clickFirst(page, [/reschedule appointment|schedule appointment|reprogramar|programar/i]).catch(() => {});
+  await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+
+  // Try direct schedule link
+  const schedLink = page.locator('a[href*="/schedule/"]').first();
+  if (await schedLink.count().catch(() => 0)) {
+    await schedLink.click({ timeout: 15000 }).catch(() => {});
+    await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+  }
+
+  details.stage = 'nav_verify_calendar';
+  const consulateDate = page.locator('input#appointments_consulate_appointment_date, input[name*="consulate_appointment_date" i]').first();
+  const ascDate = page.locator('input#appointments_asc_appointment_date, input[name*="asc_appointment_date" i]').first();
+  const hasAny = await consulateDate.isVisible().catch(() => false) || await ascDate.isVisible().catch(() => false);
+  return hasAny;
+}
+
+async function setFacility(page, city, details) {
+  details.stage = 'facility';
+
+  // Use explicit facility selects if present.
+  const sel = page.locator('select#appointments_consulate_facility_id, select#appointments_asc_facility_id, select[name*="facility" i]').first();
+  if (!await sel.count().catch(() => 0)) return false;
+
+  // Try selecting by label.
+  const ok = await sel.selectOption({ label: new RegExp(city, 'i') }).then(() => true).catch(() => false);
+  return ok;
+}
+
+async function openDatepicker(page, details) {
+  details.stage = 'open_calendar';
+
+  const dateInput = page.locator(
+    'input#appointments_consulate_appointment_date, input[name*="consulate_appointment_date" i], ' +
+    'input#appointments_asc_appointment_date, input[name*="asc_appointment_date" i]'
+  ).first();
+
+  await dateInput.click({ timeout: 15000 });
+  await page.waitForTimeout(250);
+
+  const title = page.locator('.ui-datepicker-title').first();
+  await title.waitFor({ state: 'visible', timeout: 10000 });
+
+  return { title, next: page.locator('.ui-datepicker-next, a[title*="Next"], a[aria-label*="Next"]').first() };
+}
+
+async function scanCalendar(page, desiredMonths, details) {
+  details.stage = 'scan_calendar';
+
+  const { title, next } = await openDatepicker(page, details);
+
+  const found = [];
+  let safety = 0;
+  while (safety++ < 12) {
+    const titleText = (await title.innerText().catch(() => '')).trim();
+
+    if (monthInSet(titleText, desiredMonths)) {
+      // Enabled day anchors.
+      const enabledDays = page.locator('.ui-datepicker-calendar td:not(.ui-datepicker-unselectable):not(.ui-state-disabled) a');
+      const count = await enabledDays.count().catch(() => 0);
+      if (count > 0) {
+        const days = [];
+        for (let i = 0; i < Math.min(count, 10); i++) {
+          const d = (await enabledDays.nth(i).innerText().catch(() => '')).trim();
+          if (d) days.push(d);
+        }
+        found.push({ month: titleText, days });
+      }
+    }
+
+    const canNext = await next.isVisible().catch(() => false);
+    if (!canNext) break;
+    await next.click().catch(() => {});
+    await page.waitForTimeout(400);
+  }
+
+  return found;
+}
+
 async function runVisaCheck(job) {
   const payload = JSON.parse(job.payload_json);
   const client = payload.client || {};
@@ -103,12 +315,15 @@ async function runVisaCheck(job) {
   const targetCities = splitList(client.target_cities);
   const desiredMonths = new Set(splitList(client.target_months).map(normalizeMonthToken));
 
-  if (!username || !password) {
-    return { summary: 'Blocked: missing credentials in payload', details: { stage: 'precheck' } };
-  }
-  if (!targetCities.length || !desiredMonths.size) {
-    return { summary: 'Blocked: missing targets (cities/months)', details: { stage: 'precheck' } };
-  }
+  if (!username || !password) return { summary: 'Blocked: missing credentials', details: { stage: 'precheck' } };
+  if (!targetCities.length || !desiredMonths.size) return { summary: 'Blocked: missing targets (cities/months)', details: { stage: 'precheck' } };
+
+  const details = {
+    stage: 'start',
+    portalUrl,
+    targetCities,
+    desiredMonths: Array.from(desiredMonths)
+  };
 
   const { chromium } = require('playwright');
   const path = require('path');
@@ -118,238 +333,82 @@ async function runVisaCheck(job) {
   fs.mkdirSync(profilesDir, { recursive: true });
   const userDataDir = path.join(profilesDir, `client-${client.id || 'unknown'}`);
 
-  const context = await chromium.launchPersistentContext(userDataDir, {
-    headless: false,
-    viewport: { width: 1280, height: 800 }
-  });
-  const page = await context.newPage();
-
-  const details = {
-    stage: 'start',
-    portalUrl,
-    targetCities,
-    desiredMonths: Array.from(desiredMonths)
-  };
+  let context;
+  let page;
 
   try {
-    const { origin } = new URL(portalUrl);
-
-    // Try to land on a sign-in form deterministically.
-    details.stage = 'goto';
-    const signInCandidates = [
-      portalUrl,
-      `${origin}/en-mx/niv/users/sign_in`,
-      `${origin}/en-us/niv/users/sign_in`,
-      `${origin}/niv/users/sign_in`,
-      `${origin}/users/sign_in`
-    ];
-
-    const emailSelector = 'input[type="email"], input#user_email, input[name*="email" i], input[name*="username" i], input#Email';
-
-    for (const u of signInCandidates) {
-      await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-
-      // Country gate: select Mexico if present
-      const countrySelectAny = page.locator('select').first();
-      const hasSelect = await countrySelectAny.isVisible().catch(() => false);
-      if (hasSelect) {
-        const mexOpt = page.locator('option', { hasText: /mexico/i }).first();
-        if (await mexOpt.count().catch(() => 0)) {
-          details.stage = 'country';
-          await page.locator('select').first().selectOption({ label: /mexico/i }).catch(() => {});
-          await clickFirst(page, [/go|submit|continue|next/i]).catch?.(() => {});
-          await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
-        }
-      }
-
-      const hasEmail = await page.locator(emailSelector).first().isVisible().catch(() => false);
-      if (hasEmail) break;
-
-      // Try clicking Sign in
-      await clickFirst(page, [/sign in/i]).catch?.(() => {});
-      await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
-
-      const hasEmailAfter = await page.locator(emailSelector).first().isVisible().catch(() => false);
-      if (hasEmailAfter) break;
-    }
-
-    // Bot challenge heuristics
-    const challenge = await page.locator('text=/verify you are human|checking your browser|captcha|cloudflare|challenge/i').first().isVisible().catch(() => false);
-    if (challenge) {
-      details.stage = 'challenge';
-      return { summary: 'Blocked: verification challenge (CAPTCHA/bot check)', details: { ...details, url: page.url() } };
-    }
-
-    const lockout = await page.locator('text=/account is locked/i').first().isVisible().catch(() => false);
-    if (lockout) {
-      details.stage = 'lockout';
-      return { summary: 'Blocked: account locked (cooldown required)', details };
-    }
-
-    // Fill credentials
-    details.stage = 'fill';
-    const emailInput = page.locator(emailSelector).first();
-    await emailInput.waitFor({ state: 'visible', timeout: 30000 }).catch(async () => {
-      throw new Error(`sign-in form not reachable (url=${page.url()})`);
+    context = await chromium.launchPersistentContext(userDataDir, {
+      headless: false,
+      viewport: { width: 1280, height: 800 }
     });
-    await emailInput.fill(String(username));
+    page = await context.newPage();
 
-    const passInput = page.locator('input[type="password"], input#user_password').first();
-    await passInput.waitFor({ state: 'visible', timeout: 30000 });
-    await passInput.fill(String(password));
+    // STATE: go to sign-in
+    await gotoSignIn(page, portalUrl, details);
 
-    details.stage = 'consent';
-    const consent = page.locator('label:has-text("Privacy Policy"), label:has-text("Terms")').first();
-    if (await consent.count().catch(() => 0)) await consent.click({ timeout: 5000 }).catch(() => {});
-
-    details.stage = 'submit';
-    // Common AIS consent checkbox ids/classes
-    const consentInput = page.locator('input#policy_confirmed, input[name*="policy" i][type="checkbox"], input[type="checkbox"]').first();
-    if (await consentInput.isVisible().catch(() => false)) {
-      const checked = await consentInput.isChecked().catch(() => false);
-      if (!checked) await consentInput.check({ timeout: 5000 }).catch(() => {});
+    if (await isChallenge(page)) {
+      return { summary: 'Blocked: verification challenge (CAPTCHA/bot check)', details: { ...details, ...(await pageInfo(page)) } };
     }
 
-    await clickFirst(page, [/sign in/i]).catch(() => {});
-    // Fallback: submit by pressing Enter in password field
-    await page.locator('input[type="password"], input#user_password').first().press('Enter').catch(() => {});
+    // STATE: login
+    details.stage = 'login';
+    const loginState = await doLogin(page, username, password, details);
 
-    // Give it time to redirect
-    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
-    await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
-
-    details.stage = 'post';
-    const urlNow = page.url();
-
-    const captcha = await page.locator('text=/captcha|verify you are human|checking your browser|cloudflare|challenge/i').first().isVisible().catch(() => false);
-    if (captcha) return { summary: 'Blocked: CAPTCHA / verification required', details: { ...details, url: urlNow } };
-
-    const locked = await page.locator('text=/account is locked/i').first().isVisible().catch(() => false);
-    if (locked) return { summary: 'Blocked: account locked (cooldown required)', details: { ...details, url: urlNow } };
-
-    const invalid = await page.locator('text=/invalid|incorrect|wrong.*password|wrong.*email/i').first().isVisible().catch(() => false);
-    if (invalid) return { summary: 'Blocked: invalid credentials', details: { ...details, url: urlNow } };
-
-    // Still on sign-in URL after submit can be a false positive (some AIS flows render authenticated landing content here).
-    if (/\/users\/sign_in/.test(urlNow)) {
-      const looksLoggedIn = await page.locator('text=/Current Status|Schedule Appointment|Continue|Document Delivery/i').first().isVisible().catch(() => false);
-      if (!looksLoggedIn) {
-        const msg = await page.locator('.alert, .error, .validation-summary-errors, [class*="error" i]').first().innerText().catch(() => '');
-        return { summary: `Blocked: login did not complete${msg ? ` (${msg.trim().slice(0,120)})` : ''}`, details: { ...details, url: urlNow } };
-      }
-      // Otherwise proceed as logged in.
+    if (loginState === 'blocked_challenge') {
+      return { summary: 'Blocked: verification challenge (CAPTCHA/bot check)', details: { ...details, ...(await pageInfo(page)) } };
+    }
+    if (loginState === 'blocked_lockout') {
+      return { summary: 'Blocked: account locked (cooldown required)', details: { ...details, ...(await pageInfo(page)) } };
+    }
+    if (loginState === 'blocked_invalid_creds') {
+      return { summary: 'Blocked: invalid username/password', details: { ...details, ...(await pageInfo(page)) } };
+    }
+    if (loginState !== 'logged_in') {
+      return { summary: 'Blocked: login did not complete (unknown)', details: { ...details, ...(await pageInfo(page)) } };
     }
 
-    // If we are still on sign-in, decide whether it's a real failure or we actually landed on the user home.
-    if (/\/users\/sign_in/.test(page.url())) {
-      const looksLoggedIn = await page.locator('text=/Current Status|Schedule Appointment|Continue|Document Delivery/i').first().isVisible().catch(() => false);
-      if (!looksLoggedIn) {
-        const msg = await page.locator('.alert, .error, .validation-summary-errors, [class*="error" i]').first().innerText().catch(() => '');
-        return { summary: `Blocked: login did not complete${msg ? ` (${msg.trim().slice(0,140)})` : ''}`, details: { ...details, url: page.url() } };
-      }
-      // If content looks like the authenticated landing page, proceed.
+    // STATE: navigate to calendar page
+    details.stage = 'nav_calendar';
+    const okCalendar = await gotoCalendarPage(page, details);
+    if (!okCalendar) {
+      return { summary: `Blocked: couldn't reach calendar page`, details: { ...details, ...(await pageInfo(page)) } };
     }
 
-    // Navigate toward appointment page (robust)
-    details.stage = 'nav';
-
-    // Prefer direct "Continue" / dashboard actions if present.
-    for (let i = 0; i < 4; i++) {
-      const moved = await clickFirst(page, [/continue|continuar/i]);
-      if (!moved) break;
-      await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
-    }
-
-    // Try explicit schedule/reschedule links
-    await clickFirst(page, [/reschedule appointment|schedule appointment|reprogramar|programar/i]).catch(() => {});
-    await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
-
-    // Fallback: click any link whose href contains /schedule/
-    const schedLink = page.locator('a[href*="/schedule/"]').first();
-    if (await schedLink.count().catch(() => 0)) {
-      await schedLink.click({ timeout: 15000 }).catch(() => {});
-      await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
-    }
-
-    // Verify we can see a date input / datepicker trigger
-    const consulateDate = page.locator('input#appointments_consulate_appointment_date, input[name*="consulate_appointment_date" i]').first();
-    const ascDate = page.locator('input#appointments_asc_appointment_date, input[name*="asc_appointment_date" i]').first();
-    const hasAnyDate = await consulateDate.isVisible().catch(() => false) || await ascDate.isVisible().catch(() => false);
-    if (!hasAnyDate) {
-      return { summary: `Blocked: couldn't reach calendar page (url=${page.url()})`, details: { ...details, url: page.url() } };
-    }
-
-    // Availability per city/month
+    // STATE: check availability
     details.stage = 'availability';
-    const found = [];
+    const foundByCity = [];
 
     for (const cityRaw of targetCities) {
       const city = cityRaw.trim();
+      await setFacility(page, city, details).catch(() => {});
 
-      // Pick facility (try known facility selects first)
-      const facilitySelect = page.locator('select#appointments_consulate_facility_id, select[name*="facility" i]').first();
-      if (await facilitySelect.count().catch(() => 0)) {
-        await facilitySelect.selectOption({ label: new RegExp(city, 'i') }).catch(() => {});
-      }
-
-      // Open consulate calendar first; if not present, use ASC.
-      const dateInput = page.locator('input#appointments_consulate_appointment_date, input[name*="consulate_appointment_date" i], input#appointments_asc_appointment_date, input[name*="asc_appointment_date" i]').first();
-      await dateInput.click({ timeout: 15000 });
-      await page.waitForTimeout(250);
-
-      // datepicker title and next
-      const title = page.locator('.ui-datepicker-title').first();
-      await title.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {
-        throw new Error(`calendar did not open (url=${page.url()})`);
-      });
-      const next = page.locator('.ui-datepicker-next, a[title*="Next"], a[aria-label*="Next"]').first();
-
-      let safety = 0;
-      while (safety++ < 12) {
-        const titleText = await title.innerText().catch(() => '');
-        if (monthInSet(titleText, desiredMonths)) {
-          const enabledDays = page.locator('.ui-datepicker-calendar td:not(.ui-datepicker-unselectable):not(.ui-state-disabled) a');
-          const count = await enabledDays.count().catch(() => 0);
-          if (count > 0) {
-            const days = [];
-            for (let i = 0; i < Math.min(count, 6); i++) {
-              const d = (await enabledDays.nth(i).innerText().catch(() => '')).trim();
-              if (d) days.push(d);
-            }
-            found.push({ city, month: titleText.trim(), days });
-          }
-
-          // if this month is desired but no days, still check next month
-        }
-
-        // advance month
-        const canNext = await next.isVisible().catch(() => false);
-        if (!canNext) break;
-        await next.click().catch(() => {});
-        await page.waitForTimeout(500);
-      }
+      const perMonth = await scanCalendar(page, desiredMonths, details);
+      if (perMonth.length) foundByCity.push({ city, perMonth });
     }
 
-    if (!found.length) {
+    if (!foundByCity.length) {
       return { summary: `No matches for ${Array.from(desiredMonths).join(', ')} in ${targetCities.join(', ')}`, details };
     }
 
-    const first = found[0];
-    const dayPart = first.days?.length ? ` ${first.days.join(',')}` : '';
+    // Summarize first hit
+    const firstCity = foundByCity[0];
+    const firstMonth = firstCity.perMonth[0];
+    const days = firstMonth.days?.slice(0, 8) || [];
+
     return {
-      summary: `FOUND: ${first.city} ${first.month}${dayPart}`,
-      details: { ...details, found }
+      summary: `FOUND: ${firstCity.city} ${firstMonth.month}${days.length ? ` ${days.join(',')}` : ''}`,
+      details: { ...details, foundByCity }
     };
 
   } catch (err) {
     const msg = String(err?.message || err);
     if (msg.match(/x server|display|headed|no usable sandbox/i)) {
-      return { summary: 'Blocked: worker has no desktop display for headful browser (needs X/Xvfb)', details: { ...details, error: msg } };
+      return { summary: 'Blocked: worker has no desktop display for headful browser', details: { ...details, error: msg } };
     }
-    return { summary: `Blocked: automation error (${msg})`, details: { ...details, stage: details.stage } };
+    return { summary: `Blocked: automation error (${msg})`, details: { ...details, ...(page ? await pageInfo(page) : {}) } };
   } finally {
-    await page.close().catch(() => {});
-    await context.close().catch(() => {});
+    await page?.close().catch(() => {});
+    await context?.close().catch(() => {});
   }
 }
 
@@ -364,8 +423,8 @@ async function loop() {
         continue;
       }
 
-      let result;
       try {
+        let result;
         if (job.kind === 'visa_check') result = await runVisaCheck(job);
         else result = { summary: `Unknown job kind: ${job.kind}` };
 
@@ -381,7 +440,6 @@ async function loop() {
       }
 
     } catch (err) {
-      // backoff
       await sleep(Math.min(POLL_MS * 2, 60000));
     }
   }
