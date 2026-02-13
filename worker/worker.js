@@ -236,6 +236,12 @@ async function runVisaCheck(job) {
       return { summary: `Blocked: login did not complete${msg ? ` (${msg.trim().slice(0,120)})` : ''}`, details: { ...details, url: urlNow } };
     }
 
+    // If we are still on sign-in, stop here with a clear reason.
+    if (/\/users\/sign_in/.test(page.url())) {
+      const msg = await page.locator('.alert, .error, .validation-summary-errors, [class*="error" i]').first().innerText().catch(() => '');
+      return { summary: `Blocked: login did not complete${msg ? ` (${msg.trim().slice(0,140)})` : ''}`, details: { ...details, url: page.url() } };
+    }
+
     // Navigate toward appointment page (robust)
     details.stage = 'nav';
 
