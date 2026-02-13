@@ -5,7 +5,8 @@ const path = require('path');
 const crypto = require('crypto');
 
 const app = express();
-const db = new Database(path.join(__dirname, 'data.db'));
+const DB_PATH = process.env.DB_PATH || (process.env.RENDER ? '/var/data/data.db' : path.join(__dirname, 'data.db'));
+const db = new Database(DB_PATH);
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-me-now';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change-me';

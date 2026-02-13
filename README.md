@@ -32,7 +32,8 @@ Open:
    - `ADMIN_PASSWORD`
    - `SESSION_SECRET`
    - `CREDENTIALS_KEY`
-5. Use a persistent disk if you keep SQLite in production.
+   - `DB_PATH=/var/data/data.db` (recommended on Render)
+5. Add a persistent disk mounted at `/var/data`.
 
 ### Railway
 1. New Project → Deploy from GitHub repo.
