@@ -213,15 +213,34 @@ async function runVisaCheck(job) {
     const invalid = await page.locator('text=/invalid|incorrect/i').first().isVisible().catch(() => false);
     if (invalid) return { summary: 'Blocked: invalid credentials', details };
 
-    // Navigate toward appointment page
+    // Navigate toward appointment page (robust)
     details.stage = 'nav';
-    for (let i = 0; i < 3; i++) {
+
+    // Prefer direct "Continue" / dashboard actions if present.
+    for (let i = 0; i < 4; i++) {
       const moved = await clickFirst(page, [/continue|continuar/i]);
       if (!moved) break;
       await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
     }
+
+    // Try explicit schedule/reschedule links
     await clickFirst(page, [/reschedule appointment|schedule appointment|reprogramar|programar/i]).catch(() => {});
     await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+
+    // Fallback: click any link whose href contains /schedule/
+    const schedLink = page.locator('a[href*="/schedule/"]').first();
+    if (await schedLink.count().catch(() => 0)) {
+      await schedLink.click({ timeout: 15000 }).catch(() => {});
+      await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+    }
+
+    // Verify we can see a date input / datepicker trigger
+    const consulateDate = page.locator('input#appointments_consulate_appointment_date, input[name*="consulate_appointment_date" i]').first();
+    const ascDate = page.locator('input#appointments_asc_appointment_date, input[name*="asc_appointment_date" i]').first();
+    const hasAnyDate = await consulateDate.isVisible().catch(() => false) || await ascDate.isVisible().catch(() => false);
+    if (!hasAnyDate) {
+      return { summary: `Blocked: couldn't reach calendar page (url=${page.url()})`, details: { ...details, url: page.url() } };
+    }
 
     // Availability per city/month
     details.stage = 'availability';
@@ -230,19 +249,22 @@ async function runVisaCheck(job) {
     for (const cityRaw of targetCities) {
       const city = cityRaw.trim();
 
-      // pick facility if there is a select
-      const facilitySelect = page.locator('select').filter({ has: page.locator('option') }).first();
+      // Pick facility (try known facility selects first)
+      const facilitySelect = page.locator('select#appointments_consulate_facility_id, select[name*="facility" i]').first();
       if (await facilitySelect.count().catch(() => 0)) {
-        // best-effort: select option containing city text
         await facilitySelect.selectOption({ label: new RegExp(city, 'i') }).catch(() => {});
       }
 
-      // open datepicker
-      const dateInput = page.locator('input[name*="appointment_date" i], input#appointments_consulate_appointment_date, input[type="text"]').first();
-      await dateInput.click({ timeout: 15000 }).catch(() => {});
+      // Open consulate calendar first; if not present, use ASC.
+      const dateInput = page.locator('input#appointments_consulate_appointment_date, input[name*="consulate_appointment_date" i], input#appointments_asc_appointment_date, input[name*="asc_appointment_date" i]').first();
+      await dateInput.click({ timeout: 15000 });
+      await page.waitForTimeout(250);
 
       // datepicker title and next
       const title = page.locator('.ui-datepicker-title').first();
+      await title.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {
+        throw new Error(`calendar did not open (url=${page.url()})`);
+      });
       const next = page.locator('.ui-datepicker-next, a[title*="Next"], a[aria-label*="Next"]').first();
 
       let safety = 0;
