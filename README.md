@@ -8,14 +8,15 @@ Simple intake form + admin dashboard draft.
 - Admin dashboard listing submitted clients
 - **Encrypted credential storage at rest** (AES-256-GCM via `CREDENTIALS_KEY`)
 - Per-client monitoring status + manual check controls
-- “Send to Bot” action that posts a check request to your automation webhook
+- Queue a job from the admin dashboard
+- Worker polling API (worker pulls queued jobs; no inbound access to worker required)
 - SQLite local storage
 
 ## Quick run
 ```bash
 npm install
 cp .env.example .env
-# edit .env (set ADMIN_PASSWORD + SESSION_SECRET + CREDENTIALS_KEY + bot webhook vars)
+# edit .env (set ADMIN_PASSWORD + SESSION_SECRET + CREDENTIALS_KEY + WORKER_TOKEN)
 npm start
 ```
 
@@ -34,8 +35,7 @@ Open:
    - `SESSION_SECRET`
    - `CREDENTIALS_KEY`
    - `DB_PATH=/var/data/data.db` (recommended on Render)
-   - `BOT_WEBHOOK_URL`
-   - `BOT_WEBHOOK_TOKEN`
+   - `WORKER_TOKEN`
 5. Add a persistent disk mounted at `/var/data`.
 
 ### Railway
@@ -46,10 +46,26 @@ Open:
    - `CREDENTIALS_KEY`
 3. Start command: `npm start`
 
-## Bot webhook contract
-When you click **Send to Bot**, the app POSTs JSON to `BOT_WEBHOOK_URL` with `Authorization: Bearer <BOT_WEBHOOK_TOKEN>`.
-Payload shape:
+## Worker polling API (recommended)
+Why: the worker makes **outbound** HTTPS requests to Render, so you don’t expose your home machine / worker to the public internet.
 
+### Auth
+Set `WORKER_TOKEN` in Render. Worker calls with:
+`Authorization: Bearer <WORKER_TOKEN>`
+
+### Claim a job
+`POST /api/worker/claim`
+Returns `{ job: null }` when empty, or a claimed job.
+
+### Complete a job
+`POST /api/worker/jobs/:id/complete`
+Body:
+```json
+{ "status": "done", "result": { "summary": "...", "details": {} } }
+```
+
+### Job payload
+Each job contains `payload_json` with:
 ```json
 {
   "event": "visa_check_request",

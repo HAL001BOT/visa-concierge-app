@@ -12,8 +12,8 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-me-now';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change-me';
 const PORT = process.env.PORT || 3000;
 const CREDENTIALS_KEY = process.env.CREDENTIALS_KEY || 'change-this-32-char-key-now';
-const BOT_WEBHOOK_URL = process.env.BOT_WEBHOOK_URL || '';
-const BOT_WEBHOOK_TOKEN = process.env.BOT_WEBHOOK_TOKEN || '';
+// Worker-polling model (recommended): worker polls this app for queued jobs.
+const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
 
 if (CREDENTIALS_KEY.length < 16) {
   throw new Error('CREDENTIALS_KEY must be set and reasonably long.');
@@ -46,6 +46,9 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: false }));
 
+// Needed for worker API JSON bodies
+app.use('/api/worker', express.json({ limit: '1mb' }));
+
 // DB bootstrap + lightweight migration
 const init = db.transaction(() => {
   db.prepare(`CREATE TABLE IF NOT EXISTS clients (
@@ -67,6 +70,20 @@ const init = db.transaction(() => {
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
   )`).run();
 
+  db.prepare(`CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,                 -- e.g. 'visa_check'
+    client_id INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',  -- queued|in_progress|done|error
+    result_json TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    started_at TEXT,
+    finished_at TEXT,
+    lease_expires_at TEXT,
+    FOREIGN KEY(client_id) REFERENCES clients(id)
+  )`).run();
+
   const cols = db.prepare(`PRAGMA table_info(clients)`).all().map(c => c.name);
   if (!cols.includes('password_enc')) db.prepare('ALTER TABLE clients ADD COLUMN password_enc TEXT').run();
   if (!cols.includes('monitoring_active')) db.prepare('ALTER TABLE clients ADD COLUMN monitoring_active INTEGER DEFAULT 1').run();
@@ -86,6 +103,13 @@ init();
 
 const requireAdmin = (req, res, next) => {
   if (!req.session?.admin) return res.redirect('/admin/login');
+  next();
+};
+
+const requireWorker = (req, res, next) => {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : '';
+  if (!WORKER_TOKEN || token !== WORKER_TOKEN) return res.status(401).json({ ok: false, error: 'unauthorized' });
   next();
 };
 
@@ -138,7 +162,7 @@ app.post('/admin/clients/:id/toggle', requireAdmin, (req, res) => {
   res.redirect('/admin');
 });
 
-app.post('/admin/clients/:id/check', requireAdmin, async (req, res) => {
+app.post('/admin/clients/:id/check', requireAdmin, (req, res) => {
   const id = Number(req.params.id);
   const client = db.prepare(`
     SELECT id, full_name, contact_channel, contact_handle, timezone, portal_url, username,
@@ -149,53 +173,82 @@ app.post('/admin/clients/:id/check', requireAdmin, async (req, res) => {
 
   if (!client) return res.redirect('/admin');
 
-  if (!BOT_WEBHOOK_URL || !BOT_WEBHOOK_TOKEN) {
-    db.prepare('UPDATE clients SET last_check_at=CURRENT_TIMESTAMP, last_result=? WHERE id=?')
-      .run('Bot dispatch failed: BOT_WEBHOOK_URL/TOKEN not configured', id);
-    return res.redirect('/admin');
-  }
-
-  try {
-    const password = decryptText(client.password_enc);
-    const body = {
-      event: 'visa_check_request',
-      requestedAt: new Date().toISOString(),
-      client: {
-        id: client.id,
-        full_name: client.full_name,
-        contact_channel: client.contact_channel,
-        contact_handle: client.contact_handle,
-        timezone: client.timezone,
-        portal_url: client.portal_url,
-        username: client.username,
-        password,
-        target_cities: client.target_cities,
-        target_months: client.target_months,
-        auto_book: !!client.auto_book
-      }
-    };
-
-    const response = await fetch(BOT_WEBHOOK_URL, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${BOT_WEBHOOK_TOKEN}`
-      },
-      body: JSON.stringify(body)
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+  const payload = {
+    event: 'visa_check_request',
+    requestedAt: new Date().toISOString(),
+    client: {
+      id: client.id,
+      full_name: client.full_name,
+      contact_channel: client.contact_channel,
+      contact_handle: client.contact_handle,
+      timezone: client.timezone,
+      portal_url: client.portal_url,
+      username: client.username,
+      password: decryptText(client.password_enc),
+      target_cities: client.target_cities,
+      target_months: client.target_months,
+      auto_book: !!client.auto_book
     }
+  };
 
-    db.prepare('UPDATE clients SET last_check_at=CURRENT_TIMESTAMP, last_result=? WHERE id=?')
-      .run('Sent to bot successfully', id);
-  } catch (err) {
-    db.prepare('UPDATE clients SET last_check_at=CURRENT_TIMESTAMP, last_result=? WHERE id=?')
-      .run(`Bot dispatch failed: ${err.message}`, id);
-  }
+  db.prepare('INSERT INTO jobs (kind, client_id, payload_json, status) VALUES (?, ?, ?, ?)')
+    .run('visa_check', id, JSON.stringify(payload), 'queued');
+
+  db.prepare('UPDATE clients SET last_check_at=CURRENT_TIMESTAMP, last_result=? WHERE id=?')
+    .run('Queued for worker', id);
 
   res.redirect('/admin');
+});
+
+// Worker polling endpoints
+app.post('/api/worker/claim', requireWorker, (req, res) => {
+  const leaseMinutes = 5;
+  const leaseUntil = new Date(Date.now() + leaseMinutes * 60 * 1000).toISOString();
+
+  // Re-queue expired leases
+  db.prepare(`UPDATE jobs
+              SET status='queued', lease_expires_at=NULL
+              WHERE status='in_progress' AND lease_expires_at IS NOT NULL AND lease_expires_at < CURRENT_TIMESTAMP`).run();
+
+  const job = db.prepare(`
+    SELECT * FROM jobs
+    WHERE status='queued'
+    ORDER BY created_at ASC
+    LIMIT 1
+  `).get();
+
+  if (!job) return res.json({ ok: true, job: null });
+
+  db.prepare(`UPDATE jobs
+              SET status='in_progress', started_at=COALESCE(started_at, CURRENT_TIMESTAMP), lease_expires_at=?
+              WHERE id=?`).run(leaseUntil, job.id);
+
+  const claimed = db.prepare('SELECT * FROM jobs WHERE id=?').get(job.id);
+  res.json({ ok: true, job: claimed });
+});
+
+app.post('/api/worker/jobs/:id/complete', requireWorker, (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const body = req.body || {};
+    const status = body.status === 'done' ? 'done' : 'error';
+    const resultJson = JSON.stringify(body.result || {});
+
+    db.prepare(`UPDATE jobs SET status=?, result_json=?, finished_at=CURRENT_TIMESTAMP, lease_expires_at=NULL WHERE id=?`)
+      .run(status, resultJson, id);
+
+    // Best-effort: write summary into client last_result
+    const job = db.prepare('SELECT client_id FROM jobs WHERE id=?').get(id);
+    if (job?.client_id) {
+      const summary = body.result?.summary || (status === 'done' ? 'Completed' : 'Failed');
+      db.prepare('UPDATE clients SET last_check_at=CURRENT_TIMESTAMP, last_result=? WHERE id=?')
+        .run(summary, job.client_id);
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: 'bad_request' });
+  }
 });
 
 app.get('/admin', requireAdmin, (req, res) => {
