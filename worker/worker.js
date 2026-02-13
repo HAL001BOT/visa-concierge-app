@@ -71,19 +71,43 @@ async function runVisaCheck(job) {
       `${origin}/users/sign_in`
     ];
 
+    const emailSelector = 'input[type="email"], input#user_email, input[name*="email" i], input[name*="username" i], input#Email';
+
     for (const u of signInCandidates) {
       await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-      const hasEmail = await page.locator('input[type="email"], input[name*="email" i], input#user_email, input#Email').first().isVisible().catch(() => false);
+
+      // If a country selector is shown, pick Mexico.
+      // AIS often gates sign-in behind this selection.
+      const countrySelect = page.locator('select').filter({ hasText: /mexico/i }).first();
+      const hasMexicoSelect = await countrySelect.count().then(c => c > 0).catch(() => false);
+      if (hasMexicoSelect) {
+        details.stage = 'country';
+        // Best effort: choose the first option containing Mexico
+        await page.locator('select').first().selectOption({ label: /mexico/i }).catch(() => {});
+        const submitCountry = page.getByRole('button', { name: /go|submit|continue|next/i });
+        if (await submitCountry.count()) await submitCountry.first().click().catch(() => {});
+        await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+      }
+
+      const hasEmail = await page.locator(emailSelector).first().isVisible().catch(() => false);
       if (hasEmail) break;
 
       // If we landed on a marketing page, try clicking Sign in.
       const signInLink = page.getByRole('link', { name: /sign in/i });
       if (await signInLink.count()) {
         await signInLink.first().click({ timeout: 15000 }).catch(() => {});
+        await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
       }
 
-      const hasEmailAfter = await page.locator('input[type="email"], input[name*="email" i], input#user_email, input#Email').first().isVisible().catch(() => false);
+      const hasEmailAfter = await page.locator(emailSelector).first().isVisible().catch(() => false);
       if (hasEmailAfter) break;
+    }
+
+    // Heuristics for bot challenges / verification pages that block login form.
+    const challenge = await page.locator('text=/verify you are human|checking your browser|captcha|cloudflare|challenge/i').first().isVisible().catch(() => false);
+    if (challenge) {
+      details.stage = 'challenge';
+      return { summary: 'Blocked: verification challenge (CAPTCHA/bot check)', details: { ...details, url: page.url() } };
     }
 
     // Detect lockout banner text if present.
@@ -95,8 +119,10 @@ async function runVisaCheck(job) {
 
     // Fill credentials (robust selectors)
     details.stage = 'fill';
-    const emailInput = page.locator('input[type="email"], input#user_email, input[name*="email" i], input[name*="username" i]').first();
-    await emailInput.waitFor({ state: 'visible', timeout: 30000 });
+    const emailInput = page.locator('input[type="email"], input#user_email, input[name*="email" i], input[name*="username" i], input#Email').first();
+    await emailInput.waitFor({ state: 'visible', timeout: 30000 }).catch(async () => {
+      throw new Error(`sign-in form not reachable (url=${page.url()})`);
+    });
     await emailInput.fill(String(username));
 
     const passInput = page.locator('input[type="password"], input#user_password').first();
